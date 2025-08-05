@@ -69,11 +69,17 @@ if device == 'cuda':
 
 # 加载预训练教师模型
 teacher_ckpt = './checkpoint/dla.pth'
-if os.path.exists(teacher_ckpt):
-    print(f'==> 加载教师模型 {teacher_ckpt}..')
-    teacher.load_state_dict(torch.load(teacher_ckpt))
-else:
-    raise FileNotFoundError(f"教师模型权重不存在: {teacher_ckpt}")
+checkpoint = torch.load(teacher_ckpt, map_location=device)
+state_dict = checkpoint['net']
+
+# 可选：去除 DataParallel 的 'module.' 前缀
+if all(k.startswith('module.') for k in state_dict.keys()):
+    state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
+
+teacher = DLA().to(device)
+teacher.load_state_dict(state_dict)
+if device == 'cuda':
+    teacher = torch.nn.DataParallel(teacher)
 
 teacher.eval()  # 固定教师模型
 for param in teacher.parameters():
@@ -189,91 +195,91 @@ def distill_train(epoch):
                     f'Acc: {100.*correct/total:.3f}% | '
                     f'Temp: {current_temp:.1f}')
 
-# 交叉验证参数
-num_folds = 5
-kf = KFold(n_splits=num_folds, shuffle=True, random_state=42)
-fold_results = []
+if __name__ == '__main__':
+    # 交叉验证参数
+    num_folds = 5
+    kf = KFold(n_splits=num_folds, shuffle=True, random_state=42)
+    fold_results = []
 
-# 获取全部训练数据和标签
-all_data = trainset.data
-all_targets = np.array(trainset.targets)
+    # 获取全部训练数据和标签
+    all_data = trainset.data
+    all_targets = np.array(trainset.targets)
 
-for fold, (train_idx, val_idx) in enumerate(kf.split(all_data)):
-    print(f'==> Fold {fold+1}/{num_folds}')
-    # 构建本折的训练集和验证集
-    train_data = all_data[train_idx]
-    train_targets = all_targets[train_idx]
-    val_data = all_data[val_idx]
-    val_targets = all_targets[val_idx]
+    for fold, (train_idx, val_idx) in enumerate(kf.split(all_data)):
+        print(f'==> Fold {fold+1}/{num_folds}')
+        # 构建本折的训练集和验证集
+        train_data = all_data[train_idx]
+        train_targets = all_targets[train_idx]
+        val_data = all_data[val_idx]
+        val_targets = all_targets[val_idx]
 
-    # 构建Dataset对象
-    train_foldset = torchvision.datasets.CIFAR10(
-        root='./data', train=True, download=True,
-        transform=transform_train)
-    val_foldset = torchvision.datasets.CIFAR10(
-        root='./data', train=True, download=True,
-        transform=transform_test)
-    train_foldset.data = train_data
-    train_foldset.targets = train_targets.tolist()
-    val_foldset.data = val_data
-    val_foldset.targets = val_targets.tolist()
+        # 构建Dataset对象
+        train_foldset = torchvision.datasets.CIFAR10(
+            root='./data', train=True, download=True,
+            transform=transform_train)
+        val_foldset = torchvision.datasets.CIFAR10(
+            root='./data', train=True, download=True,
+            transform=transform_test)
+        train_foldset.data = train_data
+        train_foldset.targets = train_targets.tolist()
+        val_foldset.data = val_data
+        val_foldset.targets = val_targets.tolist()
 
-    trainloader = torch.utils.data.DataLoader(
-        train_foldset, batch_size=args.batch_size, shuffle=True, num_workers=2)
-    valloader = torch.utils.data.DataLoader(
-        val_foldset, batch_size=100, shuffle=False, num_workers=2)
+        trainloader = torch.utils.data.DataLoader(
+            train_foldset, batch_size=args.batch_size, shuffle=True, num_workers=2)
+        valloader = torch.utils.data.DataLoader(
+            val_foldset, batch_size=100, shuffle=False, num_workers=2)
 
-    # 初始化学生模型
-    student = MobileNetV2().to(device)
-    if device == 'cuda':
-        student = torch.nn.DataParallel(student)
-    optimizer = optim.SGD(student.parameters(), lr=args.lr, momentum=0.9, weight_decay=5e-4)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
-    distill_loss = DistillationLoss(alpha=args.alpha, temp=args.temp).to(device)
+        # 初始化学生模型
+        student = MobileNetV2().to(device)
+        if device == 'cuda':
+            student = torch.nn.DataParallel(student)
+        optimizer = optim.SGD(student.parameters(), lr=args.lr, momentum=0.9, weight_decay=5e-4)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
+        distill_loss = DistillationLoss(alpha=args.alpha, temp=args.temp).to(device)
 
-    best_val_acc = 0
-    for epoch in range(args.epochs):
-        distill_train(epoch)  # 需修改为用本折的trainloader
-        val_acc = test(student, valloader)  # 需修改为用本折的valloader
+        best_val_acc = 0
+        for epoch in range(args.epochs):
+            distill_train(epoch)  
+            val_acc = test(student, valloader) 
+            scheduler.step()
+            if val_acc > best_val_acc:
+                best_val_acc = val_acc
+                torch.save(student.state_dict(), f'./checkpoint/mobilenetv2_fold{fold+1}.pth')
+        fold_results.append(best_val_acc)
+        print(f'Fold {fold+1} best val acc: {best_val_acc:.2f}%')
+
+    print(f'交叉验证平均准确率: {np.mean(fold_results):.2f}%')
+
+    # 正式训练阶段
+    for epoch in range(start_epoch, start_epoch+args.epochs):
+        distill_train(epoch)
+        test_acc = test(student, testloader)
         scheduler.step()
-        if val_acc > best_val_acc:
-            best_val_acc = val_acc
-            # 保存本折最佳模型
-            torch.save(student.state_dict(), f'./checkpoint/mobilenetv2_fold{fold+1}.pth')
-    fold_results.append(best_val_acc)
-    print(f'Fold {fold+1} best val acc: {best_val_acc:.2f}%')
+        
+        # 保存最佳模型
+        if test_acc > best_acc:
+            print(f'==> 保存最佳学生模型 (准确率: {test_acc:.2f}%)...')
+            state = {
+                'student': student.state_dict(),
+                'acc': test_acc,
+                'epoch': epoch,
+                'teacher': 'DLA',
+                'temp': args.temp,
+                'alpha': args.alpha
+            }
+            if not os.path.isdir('checkpoint'):
+                os.mkdir('checkpoint')
+            torch.save(state, './checkpoint/mobilenetv2_distilled.pth')
+            best_acc = test_acc
 
-print(f'交叉验证平均准确率: {np.mean(fold_results):.2f}%')
-
-# 训练循环
-for epoch in range(start_epoch, start_epoch+args.epochs):
-    distill_train(epoch)
-    test_acc = test(student)
-    scheduler.step()
-    
-    # 保存最佳模型
-    if test_acc > best_acc:
-        print(f'==> 保存最佳学生模型 (准确率: {test_acc:.2f}%)...')
-        state = {
+        # 保存最新检查点
+        torch.save({
             'student': student.state_dict(),
+            'optimizer': optimizer.state_dict(),
+            'scheduler': scheduler.state_dict(),
             'acc': test_acc,
             'epoch': epoch,
-            'teacher': 'DLA',
-            'temp': args.temp,
-            'alpha': args.alpha
-        }
-        if not os.path.isdir('checkpoint'):
-            os.mkdir('checkpoint')
-        torch.save(state, './checkpoint/mobilenetv2_distilled.pth')
-        best_acc = test_acc
+        }, './checkpoint/mobilenetv2_latest.pth')
 
-    # 保存最新检查点
-    torch.save({
-        'student': student.state_dict(),
-        'optimizer': optimizer.state_dict(),
-        'scheduler': scheduler.state_dict(),
-        'acc': test_acc,
-        'epoch': epoch,
-    }, './checkpoint/mobilenetv2_latest.pth')
-
-print(f'最佳准确率: {best_acc:.2f}%')
+    print(f'最佳准确率: {best_acc:.2f}%')
